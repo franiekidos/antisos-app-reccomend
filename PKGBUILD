@@ -24,7 +24,7 @@ sha256sums=('SKIP'
 
 build() {
     # Compile the python script into a single executable using PyInstaller
-    pyinstaller --noconfirm --onefile --name "$pkgname" antisos-app-recc.py
+    pyinstaller --noconfirm --onefile --name "$pkgname" antisos-app-recc
 }
 
 package() {
