@@ -1,0 +1,719 @@
+import gi
+import os
+import time # Used for simulating installation time
+import threading # Used for running the simulated installation in the background
+import subprocess # Used for running actual commands
+from typing import Dict, List, Set, Any
+
+# Try to import GTK 4 and Libadwaita
+try:
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    from gi.repository import Gtk, Adw, GLib
+except ImportError:
+    print("Error: Required dependencies (GTK 4, Libadwaita, and Python GObject bindings) not found.")
+    print("Please ensure 'python-gobject' and 'libadwaita' are installed.")
+    exit(1)
+
+# Custom Widget to display an application like an App Store card
+class AppCard(Gtk.Box):
+    def __init__(self, common_name: str, app_data: Dict[str, Any], resolver_app: Any):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        
+        self.common_name = common_name
+        self.app_data = app_data
+        self.resolver_app = resolver_app # Reference to the main application for state changes
+        
+        # Track selected state for the main app
+        self.resolver_app.selected_packages[common_name] = False
+
+        self.set_css_classes(['card', 'rounded-lg', 'shadow-md'])
+        self.set_size_request(200, 150) # Minimum card size
+        
+        # Set margins
+        self.set_margin_start(8)
+        self.set_margin_end(8)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+        
+        self.set_halign(Gtk.Align.FILL)
+        self.set_valign(Gtk.Align.FILL)
+        
+        container = Gtk.Box.new(Gtk.Orientation.VERTICAL, 10)
+
+        # Set container margins
+        container.set_margin_start(15)
+        container.set_margin_end(15)
+        container.set_margin_top(15)
+        container.set_margin_bottom(15)
+        
+        # 1. Icon and Title
+        header_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 12)
+
+        icon = Gtk.Image.new_from_icon_name(app_data['icon'])
+        icon.set_icon_size(Gtk.IconSize.LARGE)
+        
+        # Name and Checkbox on the right
+        name_box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0)
+        
+        title_label = Gtk.Label.new(app_data['name'])
+        title_label.set_halign(Gtk.Align.START)
+        title_label.set_ellipsize(True)
+        title_label.add_css_class('title-4')
+        
+        self.check_button = Gtk.CheckButton.new()
+        self.check_button.set_halign(Gtk.Align.CENTER)
+        self.check_button.set_valign(Gtk.Align.CENTER)
+        self.check_button.connect('toggled', self.on_toggled) # Connect the signal here
+
+        name_container = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
+        name_container.append(title_label) # Add title label to name_container
+        name_container.append(self.check_button)
+
+        header_box.append(icon)
+        header_box.set_spacing(12)
+        header_box.append(name_container)
+
+        # 2. Description
+        desc_label = Gtk.Label.new(app_data['desc'])
+        desc_label.set_wrap(True)
+        desc_label.set_justify(Gtk.Justification.LEFT)
+        desc_label.set_halign(Gtk.Align.START)
+        desc_label.set_max_width_chars(35)
+        desc_label.add_css_class('body')
+        
+        container.append(header_box) # Append the header_box (icon + name + checkbox)
+        container.append(desc_label)
+
+        self.append(container) 
+
+    def on_toggled(self, check_button):
+        """Updates the main application's state when a package is selected."""
+        is_selected = check_button.get_active()
+        self.resolver_app.selected_packages[self.common_name] = is_selected
+        
+        if is_selected:
+            self.add_css_class('suggested-action') # Highlight selected card
+        else:
+            self.remove_css_class('suggested-action')
+
+
+class AppStoreResolver(Adw.Application):
+    """
+    A Libadwaita application for generating categorized installation commands,
+    and simulating their execution in a log view.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(application_id='com.gemini.AppStoreResolver', **kwargs)
+        self.connect('activate', self.on_activate)
+
+        # STATE TRACKING
+        self.source_states: Dict[str, bool] = {
+            'flatpak': True,
+            'snap': False,
+            'aur': True,
+            'nix': False
+        }
+        self.selected_packages: Dict[str, bool] = {} 
+        self.is_installing = False # State for tracking installation status
+
+        # FULL PACKAGE CATALOG
+        self.catalog: Dict[str, Dict[str, Any]] = {
+            '1password': {'name': '1Password', 'icon': 'password-manager-symbolic', 'desc': 'Secure password and identity management.', 'map': {'snap': '1password', 'aur': '1password', 'nix': 'onepassword'}},
+            'zen browser': {'name': 'Zen Browser', 'icon': 'web-browser-symbolic', 'desc': 'Focus-oriented web browsing environment.', 'map': {'aur': 'zen-browser-bin'}},
+            'brave': {'name': 'Brave Browser', 'icon': 'web-browser-symbolic', 'desc': 'Fast, private, secure web browser.', 'map': {'flatpak': 'com.brave.Browser', 'snap': 'brave', 'aur': 'brave-bin', 'nix': 'brave'}},
+            'librewolf': {'name': 'LibreWolf', 'icon': 'web-browser-symbolic', 'desc': 'Privacy-focused Firefox fork.', 'map': {'flatpak': 'io.gitlab.librewolf-community', 'aur': 'librewolf', 'nix': 'librewolf'}},
+            'redshift': {'name': 'Redshift', 'icon': 'display-brightness-symbolic', 'desc': 'Adjusts screen temperature according to surroundings.', 'map': {'flatpak': 'org.geoclue.Redshift', 'snap': 'redshift', 'aur': 'redshift', 'nix': 'redshift'}},
+            'keepassxc': {'name': 'KeePassXC', 'icon': 'key-symbolic', 'desc': 'Free, cross-platform password manager.', 'map': {'flatpak': 'org.keepassxc.KeePassXC', 'snap': 'keepassxc', 'aur': 'keepassxc', 'nix': 'keepassxc'}},
+            'chrome': {'name': 'Google Chrome', 'icon': 'web-browser-symbolic', 'desc': 'Google’s proprietary web browser.', 'map': {'snap': 'google-chrome', 'aur': 'google-chrome', 'nix': 'google-chrome'}},
+            'libreoffice': {'name': 'LibreOffice', 'icon': 'x-office-document-symbolic', 'desc': 'The powerful, free, and open-source office suite.', 'map': {'flatpak': 'org.libreoffice.LibreOffice', 'snap': 'libreoffice', 'aur': 'libreoffice-fresh', 'nix': 'libreoffice'}},
+            'chromium': {'name': 'Chromium', 'icon': 'web-browser-symbolic', 'desc': 'Open-source basis for Chrome.', 'map': {'flatpak': 'org.chromium.Chromium', 'snap': 'chromium', 'aur': 'chromium', 'nix': 'chromium'}},
+            'ungoogled chromium': {'name': 'Ungoogled Chromium', 'icon': 'web-browser-symbolic', 'desc': 'Chromium without Google services integration.', 'map': {'flatpak': 'com.github.Eloston.UngoogledChromium', 'aur': 'ungoogled-chromium', 'nix': 'ungoogled-chromium'}},
+            'vscode': {'name': 'VS Code', 'icon': 'code-editor-symbolic', 'desc': 'Microsoft’s popular code editor.', 'map': {'flatpak': 'com.visualstudio.Code', 'snap': 'code', 'aur': 'visual-studio-code-bin', 'nix': 'vscode'}},
+            'vscodium': {'name': 'VSCodium', 'icon': 'code-editor-symbolic', 'desc': 'VS Code without Microsoft telemetry.', 'map': {'flatpak': 'com.vscodium.codium', 'aur': 'vscodium-bin', 'nix': 'vscodium'}},
+            'bottles': {'name': 'Bottles', 'icon': 'wine-symbolic', 'desc': 'Manage Windows environments (Wine/Proton) easily.', 'map': {'flatpak': 'com.usebottles.bottles', 'aur': 'bottles', 'nix': 'bottles'}},
+            'spotify': {'name': 'Spotify', 'icon': 'audio-volume-high-symbolic', 'desc': 'Digital music, podcast, and video streaming service.', 'map': {'flatpak': 'com.spotify.Client', 'snap': 'spotify', 'aur': 'spotify', 'nix': 'spotify'}},
+            'zoom': {'name': 'Zoom', 'icon': 'camera-symbolic', 'desc': 'Video conferencing and collaboration tool.', 'map': {'flatpak': 'us.zoom.Zoom', 'snap': 'zoom-client', 'aur': 'zoom', 'nix': 'zoom'}},
+            'wine': {'name': 'Wine', 'icon': 'wine-symbolic', 'desc': 'Compatibility layer for running Windows applications.', 'map': {'flatpak': 'org.winehq.Wine', 'aur': 'wine', 'nix': 'wine'}},
+            'goofcord': {'name': 'Goofcord', 'icon': 'discord-symbolic', 'desc': 'Discord client alternative.', 'map': {'aur': 'goofcord-bin'}},
+            'vesktop': {'name': 'Vesktop', 'icon': 'discord-symbolic', 'desc': 'Custom Discord client with Vencord pre-installed.', 'map': {'aur': 'vesktop-bin'}},
+            'helium browser': {'name': 'Helium Browser', 'icon': 'web-browser-symbolic', 'desc': 'Minimalist browser for floating video overlays.', 'map': {'aur': 'helium-browser'}},
+            'lutris': {'name': 'Lutris', 'icon': 'computer-symbolic', 'desc': 'Open Gaming Platform for Linux.', 'map': {'flatpak': 'net.lutris.Lutris', 'snap': 'lutris', 'aur': 'lutris', 'nix': 'lutris'}},
+            'krita': {'name': 'Krita', 'icon': 'krita-symbolic', 'desc': 'Professional free and open-source painting program.', 'map': {'flatpak': 'org.kde.krita', 'snap': 'krita', 'aur': 'krita', 'nix': 'krita'}},
+            'gimp': {'name': 'GIMP', 'icon': 'gimp-symbolic', 'desc': 'GNU Image Manipulation Program.', 'map': {'flatpak': 'org.gimp.GIMP', 'snap': 'gimp', 'aur': 'gimp', 'nix': 'gimp'}},
+            'kdenlive': {'name': 'Kdenlive', 'icon': 'video-display-symbolic', 'desc': 'Free and open-source video editing software.', 'map': {'flatpak': 'org.kde.kdenlive', 'snap': 'kdenlive', 'aur': 'kdenlive', 'nix': 'kdenlive'}},
+            'steam': {'name': 'Steam', 'icon': 'game-symbolic', 'desc': 'Valve\'s digital distribution service for PC games.', 'map': {'flatpak': 'com.valvesoftware.Steam', 'snap': 'steam', 'aur': 'steam', 'nix': 'steam'}},
+        }
+
+    def on_source_toggled(self, switch: Gtk.Switch, pspec, source: str):
+        """Updates the internal state when a source switch is toggled."""
+        self.source_states[source] = switch.get_active()
+
+    def on_activate(self, app):
+        """Called when the application is activated."""
+        self.create_window()
+
+    def create_window(self):
+        """Builds the main Libadwaita application window."""
+        self.window = Adw.ApplicationWindow.new(self)
+        self.window.set_default_size(900, 700)
+        self.window.set_title("App Resolver Store")
+        
+        # --- Header Bar ---
+        header_bar = Adw.HeaderBar.new()
+        header_bar.set_title_widget(Adw.WindowTitle.new("Linux App Installer", "Select apps, generate script"))
+        
+        # --- View Stack (Config, App Store, Output) ---
+        self.view_stack = Adw.ViewStack.new()
+
+        # 1. Source Configuration Page
+        config_page = self._create_config_page()
+        self.view_stack.add_titled(config_page, "config", "1. Sources")
+
+        # 2. App Store Selection Page
+        app_store_page = self._create_app_store_page()
+        self.view_stack.add_titled(app_store_page, "selection", "2. Selection")
+        
+        # 3. Output/Log Page
+        output_page = self._create_output_page()
+        self.view_stack.add_titled(output_page, "output", "3. Installation Log")
+
+        # --- View Switcher ---
+        view_switcher = Adw.ViewSwitcher.new()
+        view_switcher.set_stack(self.view_stack)
+
+        # --- Main Layout ---
+        splitter = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        splitter.set_start_child(view_switcher)
+        splitter.set_end_child(self.view_stack)
+        splitter.set_shrink_start_child(False)
+        splitter.set_resize_end_child(True)
+
+        content = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0)
+        content.append(header_bar)
+        content.append(splitter)
+
+        self.window.set_content(content)
+        self.window.present()
+
+    def _create_config_page(self) -> Gtk.Widget:
+        """Creates the source configuration view."""
+        page = Adw.PreferencesPage.new()
+
+        # --- Group 1: Installation Sources (Toggles) ---
+        group_sources = Adw.PreferencesGroup.new()
+        group_sources.set_title("Installation Sources")
+        group_sources.set_description("Enable the package systems available on your machine. Priority is Flatpak > Snap > AUR > Nix.")
+
+        # Flatpak
+        flatpak_row = Adw.SwitchRow.new()
+        flatpak_row.set_title("Flatpak (Recommended)")
+        flatpak_row.set_subtitle("Universal Linux packaging via Flathub.")
+        flatpak_row.set_active(self.source_states['flatpak'])
+        flatpak_row.add_css_class('pill')
+        flatpak_row.connect('notify::active', self.on_source_toggled, 'flatpak')
+        group_sources.add(flatpak_row)
+        
+        # Snap
+        snap_row = Adw.SwitchRow.new()
+        snap_row.set_title("Snap")
+        snap_row.set_subtitle("Canonical's package system.")
+        snap_row.add_css_class('pill')
+        snap_row.set_active(self.source_states['snap'])
+        snap_row.connect('notify::active', self.on_source_toggled, 'snap')
+        group_sources.add(snap_row)
+
+        # AUR/Pacman
+        aur_row = Adw.SwitchRow.new()
+        aur_row.set_title("AUR / Pacman (Arch)")
+        aur_row.set_subtitle("Requires Paru or Yay for AUR packages.")
+        aur_row.add_css_class('pill')
+        aur_row.set_active(self.source_states['aur'])
+        aur_row.connect('notify::active', self.on_source_toggled, 'aur')
+        group_sources.add(aur_row)
+
+        # Nix
+        nix_row = Adw.SwitchRow.new()
+        nix_row.set_title("Nix")
+        nix_row.set_subtitle("Installs packages via the Nix package manager.")
+        nix_row.add_css_class('pill')
+        nix_row.set_active(self.source_states['nix'])
+        nix_row.connect('notify::active', self.on_source_toggled, 'nix')
+        group_sources.add(nix_row)
+
+        page.add(group_sources)
+        
+        # --- Action Button ---
+        generate_button = Gtk.Button.new_with_label("Go to Package Selection")
+        generate_button.add_css_class('pill')
+        generate_button.add_css_class('suggested-action')
+        generate_button.connect('clicked', lambda *args: self.view_stack.set_visible_child_name("selection"))
+        
+        action_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
+        action_box.set_halign(Gtk.Align.END)
+        action_box.set_margin_top(20)
+        action_box.set_margin_end(24)
+        action_box.append(generate_button)
+        
+        group_actions = Adw.PreferencesGroup.new()
+        group_actions.add(action_box)
+        page.add(group_actions)
+
+        return page
+
+    def _create_app_store_page(self) -> Gtk.Widget:
+        """Creates the app store-style selection view."""
+        
+        flow_box = Gtk.FlowBox.new()
+        flow_box.set_homogeneous(False)
+        flow_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow_box.set_valign(Gtk.Align.START)
+        flow_box.set_max_children_per_line(5) # Responsive guide
+        flow_box.set_column_spacing(10)
+        flow_box.set_row_spacing(10)
+        
+        # Populate FlowBox with AppCards
+        for key, data in self.catalog.items():
+            card = AppCard(key, data, self)
+            flow_box.append(card)
+
+        # Scrollable container
+        scrolled_window = Gtk.ScrolledWindow.new()
+        scrolled_window.set_child(Adw.Clamp.new())
+        scrolled_window.get_child().set_child(flow_box)
+        
+        scrolled_window.set_margin_start(20)
+        scrolled_window.set_margin_end(20)
+        scrolled_window.set_margin_top(20)
+        scrolled_window.set_margin_bottom(20)
+        
+        scrolled_window.set_vexpand(True)
+
+        # Box to hold FlowBox and Generate Button
+        box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 15)
+        box.append(scrolled_window)
+
+        # Generate Button
+        generate_button = Gtk.Button.new_with_label("Generate Installation Plan")
+        generate_button.add_css_class('pill')
+        generate_button.add_css_class('suggested-action')
+        generate_button.connect('clicked', self.on_generate_clicked)
+
+        action_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
+        action_box.set_halign(Gtk.Align.CENTER)
+        action_box.set_margin_bottom(20)
+        action_box.append(generate_button)
+        box.append(action_box)
+
+        return box
+
+
+    def _create_output_page(self) -> Gtk.Widget:
+        """
+        Creates the output view to display the generated script and the installation log.
+        """
+        
+        # Buffer for the live installation log (default view)
+        self.output_buffer = Gtk.TextBuffer.new()
+        
+        # Buffer for the script preview
+        self.script_preview_buffer = Gtk.TextBuffer.new()
+        
+        # View for the log/script
+        self.output_text_view = Gtk.TextView.new_with_buffer(self.output_buffer)
+        self.output_text_view.set_monospace(True)
+        self.output_text_view.set_editable(False)
+        self.output_text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+
+        output_scroll = Gtk.ScrolledWindow.new()
+        output_scroll.set_child(self.output_text_view)
+        output_scroll.set_size_request(400, 500)
+        
+        output_scroll.set_margin_start(24)
+        output_scroll.set_margin_end(24)
+        output_scroll.set_margin_top(24)
+        output_scroll.set_margin_bottom(24)
+
+        # New: Install Button
+        self.install_button = Gtk.Button.new_with_label("Install Selected Apps")
+        self.install_button.add_css_class('suggested-action')
+        self.install_button.add_css_class('pill')
+        self.install_button.connect('clicked', self.on_install_clicked)
+        self.install_button.set_sensitive(False) # Disabled until plan is generated
+
+        # New: View Script/View Log Toggle
+        self.view_mode_switch = Gtk.Switch.new()
+        self.view_mode_switch.set_active(False) # Start showing log buffer (False)
+        self.view_mode_switch.add_css_class('flat') # Make the switch pill-shaped
+        self.view_mode_switch.connect('notify::active', self.on_view_mode_toggled)
+        
+        # Label for the toggle
+        view_label = Gtk.Label.new("View Script / View Log")
+        
+        # Status Page container
+        self.status_page = Adw.StatusPage.new()
+        self.status_page.set_icon_name("software-install-symbolic")
+        self.status_page.set_title("Plan Not Generated")
+        self.status_page.set_description("Select your apps and click 'Generate Installation Plan' to see the script.")
+        
+        # Layout (Wrap TextView and Buttons inside a container)
+        container = Gtk.Box.new(Gtk.Orientation.VERTICAL, 18)
+        container.set_vexpand(True)
+        container.set_valign(Gtk.Align.FILL)
+        container.append(output_scroll)
+        
+        # Control Box
+        control_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 20)
+        control_box.set_halign(Gtk.Align.CENTER)
+        control_box.set_margin_bottom(20)
+        
+        # Toggle Box
+        toggle_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
+        toggle_box.append(view_label)
+        toggle_box.append(self.view_mode_switch)
+        
+        control_box.append(toggle_box)
+        control_box.append(self.install_button)
+        
+        container.append(control_box)
+
+        self.status_page.set_child(container)
+        
+        return self.status_page
+
+    def on_view_mode_toggled(self, switch, pspec):
+        """Switches the TextView's buffer between the log and the script preview."""
+        if switch.get_active():
+            # True: Show Script Preview
+            self.output_text_view.set_buffer(self.script_preview_buffer)
+            self.output_text_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        else:
+            # False: Show Live Log
+            self.output_text_view.set_buffer(self.output_buffer)
+            self.output_text_view.set_wrap_mode(Gtk.WrapMode.NONE) # Terminal output usually doesn't wrap
+
+    def _append_to_log(self, text: str):
+        """Safely appends text to the GtkTextBuffer from a background thread."""
+        
+        # Use GLib.idle_add to execute the UI update function in the main thread
+        def update_ui():
+            end_iter = self.output_buffer.get_end_iter()
+            self.output_buffer.insert(end_iter, text)
+            
+            # Auto-scroll to the bottom
+            mark = self.output_buffer.get_mark("insert")
+            self.output_text_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+            return GLib.SOURCE_REMOVE
+            
+        GLib.idle_add(update_ui)
+
+    # Old simulation function, kept for reference or fallback if actual execution is not desired
+    def _simulate_installation(self, script_content: str):
+        """
+        Simulates running the installation script line by line in a background thread.
+        In a real application, this would be a subprocess call streaming output.
+        """
+        # Parse the script into separate command blocks
+        blocks = script_content.split('\n\n')
+        
+        for block in blocks:
+            if not block.strip():
+                continue
+            
+            lines = block.strip().split('\n')
+            
+            # Extract header and command line
+            header_lines = [line for line in lines if line.startswith('#')]
+            command_line = [line for line in lines if not line.startswith('#') and line.strip()]
+            
+            if not command_line and header_lines:
+                # This is likely a comment block or unresolved warning
+                self._append_to_log("\n" + "\n".join(header_lines) + "\n")
+                time.sleep(0.5)
+                continue
+                
+            if not command_line:
+                continue
+
+            command = command_line[0]
+            
+            self._append_to_log(f"\n$ {command}\n")
+            time.sleep(1) # Simulate command start delay
+
+            # Simulate commands that need elevated privileges
+            if 'sudo' in command or 'paru' in command:
+                self._append_to_log(f"-> Requires elevated permissions. A system password prompt would appear now.\n")
+                time.sleep(1.5)
+
+            # Simulate installation progress
+            try:
+                # Get the package names from the end of the command string
+                packages = command.split(' ', 3)[-1]
+            except IndexError:
+                packages = "package(s)"
+
+            self._append_to_log(f"[{packages}] Resolving dependencies...\n")
+            time.sleep(1)
+            self._append_to_log(f"[{packages}] Downloading package data...\n")
+            time.sleep(1)
+            self._append_to_log(f"[{packages}] Installation complete. \n")
+            
+        # Final status update via GLib.idle_add
+        def final_update():
+            self.is_installing = False
+            self.install_button.set_label("Install Selected Apps")
+            self.install_button.set_sensitive(True)
+            self.view_mode_switch.set_sensitive(True)
+            self.status_page.set_title("Installation Finished!")
+            self.status_page.set_description("All commands have been processed. Check the log above for details.")
+            self._append_to_log("\n--- Installation Finished ---\n")
+            return GLib.SOURCE_REMOVE
+            
+        GLib.idle_add(final_update)
+
+    def _execute_installation_script(self, script_content: str):
+        """
+        Executes the generated installation script using subprocess,
+        streaming output to the GtkTextBuffer.
+        """
+        self._append_to_log("--- Starting Real Installation ---\n\n")
+        
+        # Write the script content to a temporary file
+        script_path = "/tmp/install_script.sh"
+        try:
+            with open(script_path, "w") as f:
+                f.write(script_content)
+            os.chmod(script_path, 0o755) # Make it executable
+        except IOError as e:
+            self._append_to_log(f"Error writing script to file: {e}\n")
+            self._finish_installation(success=False)
+            return
+
+        try:
+            # Start the subprocess
+            # Use Popen to stream output in real-time
+            process = subprocess.Popen(
+                ['bash', script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, # Merge stderr into stdout
+                text=True, # Decode output as text
+                bufsize=1 # Line-buffered output
+            )
+
+            # Read output line by line and append to log
+            for line in process.stdout:
+                self._append_to_log(line)
+            
+            process.wait() # Wait for the process to finish
+
+            if process.returncode == 0:
+                self._finish_installation(success=True)
+            else:
+                self._append_to_log(f"\n--- Installation Failed with exit code {process.returncode} ---\n")
+                self._finish_installation(success=False)
+
+        except FileNotFoundError:
+            self._append_to_log("Error: 'bash' command not found. Is bash installed and in your PATH?\n")
+            self._finish_installation(success=False)
+        except Exception as e:
+            self._append_to_log(f"An unexpected error occurred during installation: {e}\n")
+            self._finish_installation(success=False)
+        finally:
+            # Clean up the temporary script file
+            if os.path.exists(script_path):
+                try:
+                    os.remove(script_path)
+                except OSError as e:
+                    self._append_to_log(f"Warning: Could not remove temporary script file {script_path}: {e}\n")
+
+
+
+    def on_install_clicked(self, button: Gtk.Button):
+        """
+        Initiates the installation process by generating the script and
+        running a simulated background task.
+        """
+        if self.is_installing:
+            return
+
+        generated_script = self.generate_commands()
+        
+        # Check for error or no packages selected
+        if generated_script.startswith("# Error"):
+            self.output_buffer.set_text(generated_script)
+            return
+
+        # Disable controls and set status
+        self.is_installing = True
+        button.set_label("Installing...")
+        button.set_sensitive(False)
+        self.view_mode_switch.set_active(False) # Force log view
+        self.view_mode_switch.set_sensitive(False)
+        self.output_text_view.set_buffer(self.output_buffer) # Ensure log view is active
+
+        self.status_page.set_title("Installation in Progress...")
+        self.status_page.set_description("Viewing live output from the installation commands.")
+        
+        # Start the actual installation in a separate thread
+        thread = threading.Thread(target=self._execute_installation_script, args=(generated_script,))
+        thread.start()
+
+    def _finish_installation(self, success: bool):
+        """Helper to update UI after installation finishes."""
+        def final_update():
+            self.is_installing = False
+            self.install_button.set_label("Install Selected Apps")
+            self.install_button.set_sensitive(True)
+            self.view_mode_switch.set_sensitive(True)
+            self.status_page.set_title("Installation Finished!" if success else "Installation Completed with Errors")
+            self.status_page.set_description("Check the log above for details." if success else "Review the log for errors.")
+            return GLib.SOURCE_REMOVE
+        
+        GLib.idle_add(final_update)
+
+        
+
+    def generate_commands(self) -> str:
+        """Generates the structured command list based on source toggles and selected packages."""
+        
+        # Commands grouped by source
+        commands: Dict[str, Set[str]] = {
+            'Flatpak': set(),
+            'Snap': set(),
+            'AUR/Pacman (Paru)': set(),
+            'Nix': set(),
+            'Unresolved': set()
+        }
+        
+        # Command definitions
+        flatpak_cmd = "flatpak install flathub -y "
+        snap_cmd = "sudo snap install "
+        aur_cmd = "paru -S --needed --noconfirm "
+        nix_cmd_start = "nix-env -iA "
+        nix_cmd_pkg_prefix = "nixpkgs."
+        
+        # Get only the packages the user selected
+        selected_app_keys = [
+            key for key, is_selected in self.selected_packages.items() 
+            if is_selected
+        ]
+        
+        if not selected_app_keys:
+            return "# Error: No packages were selected. Please select one or more apps from the Selection tab."
+
+        # Track packages that have been successfully mapped to enforce priority
+        mapped_packages: Set[str] = set()
+
+        for key in selected_app_keys:
+            pkg_data = self.catalog.get(key, {})
+            pkg_map = pkg_data.get('map', {})
+            
+            installed = False
+
+            # Priority 1: Flatpak
+            if self.source_states['flatpak'] and pkg_map.get('flatpak') and key not in mapped_packages:
+                commands['Flatpak'].add(pkg_map['flatpak'])
+                mapped_packages.add(key)
+                installed = True
+            
+            # Priority 2: Snap
+            if not installed and self.source_states['snap'] and pkg_map.get('snap') and key not in mapped_packages:
+                commands['Snap'].add(pkg_map['snap'])
+                mapped_packages.add(key)
+                installed = True
+
+            # Priority 3: AUR/Pacman
+            if not installed and self.source_states['aur'] and pkg_map.get('aur') and key not in mapped_packages:
+                commands['AUR/Pacman (Paru)'].add(pkg_map['aur'])
+                mapped_packages.add(key)
+                installed = True
+                
+            # Priority 4: Nix
+            if not installed and self.source_states['nix'] and pkg_map.get('nix') and key not in mapped_packages:
+                commands['Nix'].add(pkg_map['nix'])
+                mapped_packages.add(key)
+                installed = True
+
+            if not installed:
+                 commands['Unresolved'].add(pkg_data.get('name', key))
+
+        # --- Format Output ---
+        output_parts: List[str] = []
+        
+        output_parts.append("#!/bin/bash")
+        output_parts.append("# --- Installation Script Generated by App Resolver Store ---")
+        output_parts.append("# Enabled Sources (Priority: Flatpak > Snap > AUR > Nix):")
+        output_parts.append(f"# Flatpak: {'Enabled' if self.source_states['flatpak'] else 'Disabled'}")
+        output_parts.append(f"# Snap:    {'Enabled' if self.source_states['snap'] else 'Disabled'}")
+        output_parts.append(f"# AUR:     {'Enabled' if self.source_states['aur'] else 'Disabled'}")
+        output_parts.append(f"# Nix:     {'Enabled' if self.source_states['nix'] else 'Disabled'}")
+        output_parts.append("----------------------------------------------------------")
+
+        for source in ['Flatpak', 'Snap', 'AUR/Pacman (Paru)', 'Nix', 'Unresolved']:
+            pkg_set = commands.get(source, set())
+            if not pkg_set:
+                continue
+
+            output_parts.append(f"\n## {source} Packages ({len(pkg_set)})")
+            output_parts.append("# ----------------------------------------------------------")
+            
+            if source == 'Flatpak':
+                output_parts.append(f"{flatpak_cmd} {' '.join(sorted(pkg_set))}")
+            elif source == 'Snap':
+                output_parts.append(f"{snap_cmd} {' '.join(sorted(pkg_set))}")
+            elif source == 'AUR/Pacman (Paru)':
+                output_parts.append(f"{aur_cmd} {' '.join(sorted(pkg_set))}")
+            elif source == 'Nix':
+                nix_packages = [f'{nix_cmd_pkg_prefix}{p}' for p in sorted(pkg_set)]
+                output_parts.append(f"{nix_cmd_start} {' '.join(nix_packages)}")
+            elif source == 'Unresolved':
+                output_parts.append(f"# WARNING: The following selected packages could not be mapped to any enabled source:")
+                output_parts.append(f"# {', '.join(sorted(pkg_set))}")
+
+        return '\n'.join(output_parts)
+
+    def on_generate_clicked(self, button):
+        """
+        Generates the script, updates the script preview buffer,
+        enables the install button, and switches to the output view.
+        """
+        generated_script = self.generate_commands()
+        
+        # Always update the script preview buffer
+        self.script_preview_buffer.set_text(generated_script)
+        
+        # Update status and button visibility
+        selected_count = sum(self.selected_packages.values())
+        
+        if generated_script.startswith("# Error"):
+            # Set log to error and disable install
+            self.output_buffer.set_text(generated_script)
+            self.status_page.set_title("Selection Required")
+            self.status_page.set_description("Please go back to the Selection tab and choose the packages you want to install.")
+            self.install_button.set_sensitive(False)
+        else:
+            # Prepare log view and enable install
+            self.output_buffer.set_text(
+                f"# Installation plan generated for {selected_count} apps.\n"
+                f"# Click 'Install Selected Apps' to begin the simulated execution.\n"
+                f"# Use the toggle to 'View Script' preview before installing.\n"
+            )
+            self.status_page.set_title(f"{selected_count} Apps Ready to Install")
+            self.status_page.set_description(
+                "Click the Install button to start the installation process. "
+                "Output will be streamed live below."
+            )
+            self.install_button.set_sensitive(True)
+            self.view_mode_switch.set_active(False) # Default to log view
+
+        # Switch to the output tab
+        self.view_stack.set_visible_child_name("output")
+
+
+if __name__ == '__main__':
+    # Set the application name for display in the shell
+    os.environ['GIO_APPLICATION_NAME'] = "GNOME Multi-System App Store"
+    # Enable GLib/GObject concurrency for threading
+    GLib.threads_init() 
+    app = AppStoreResolver()
+    app.run(None)
