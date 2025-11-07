@@ -16,11 +16,9 @@ optdepends=(
     'nix: for Nix support'
 )
 # For local builds, ensure these files are in the same directory as the PKGBUILD
-source=("antisos-app-recc.py"
-        "antisos-store.desktop")
+source=("git+https://github.com/franiekidos/antisos-app-reccomend.git")
 
-sha256sums=('SKIP'
-            'SKIP')
+sha256sums=('SKIP')
 
 build() {
     # Compile the python script into a single executable using PyInstaller
