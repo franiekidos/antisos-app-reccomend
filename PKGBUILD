@@ -21,6 +21,7 @@ source=("git+https://github.com/franiekidos/antisos-app-reccomend.git")
 sha256sums=('SKIP')
 
 build() {
+    cd antisos-app-reccomend
     # Compile the python script into a single executable using PyInstaller
     pyinstaller --noconfirm --onefile --name "$pkgname" antisos-app-recc
 }
@@ -28,9 +29,9 @@ build() {
 package() {
     # Install the compiled executable from the dist/ directory
     install -d "$pkgdir/usr/bin"
-    install -m755 "dist/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -m755 "antisos-app-reccomend/dist/$pkgname" "$pkgdir/usr/bin/$pkgname"
 
     # Install the desktop entry
     install -d "$pkgdir/usr/share/applications"
-    install -m644 "$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -m644 "antisos-app-reccomend/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
 }
