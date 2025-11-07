@@ -7,7 +7,7 @@ arch=('any')
 url="https://github.com/antis-build"
 license=('MIT')
 depends=('gtk4' 'libadwaita')
-makedepends=('python-pyinstaller' 'python-gobject')
+makedepends=('pyinstaller' 'python-gobject')
 optdepends=(
     'paru: for AUR package installation'
     'yay: for AUR package installation'
